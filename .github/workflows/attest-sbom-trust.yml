@@ -1,0 +1,62 @@
+name: attest-sbom protected data-only trust split
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Explicit data-only lower-head checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+      - name: Write owner-only valid SBOM outside checkout
+        shell: bash
+        env:
+          OWNER_CANARY: ${{ secrets.SBOM_CANARY }}
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          value={'spdxVersion':'SPDX-2.3','SPDXID':'SPDXRef-DOCUMENT','name':'owned-secret-sbom','documentNamespace':'https://controlled.invalid/owned-sbom','comment':os.environ['OWNER_CANARY']}
+          pathlib.Path(os.environ['RUNNER_TEMP'],'owner-sbom.json').write_text(json.dumps(value,sort_keys=True,separators=(',',':')))
+          PY
+      - name: Attest fixed in-checkout SBOM path
+        id: attest
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e
+        with:
+          subject-name: owned-attest-sbom-subject
+          subject-digest: sha256:58407977e2aa824ae0acd3983dd412c404d0ca04cd61cf8bff77c9982dfcd918
+          sbom-path: ${{ github.workspace }}/data/sbom.json
+          show-summary: false
+      - name: Owner-side sanitized bundle projection
+        if: always()
+        shell: bash
+        env:
+          OWNER_CANARY: ${{ secrets.SBOM_CANARY }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          canary=os.environ['OWNER_CANARY']
+          found=False; predicate_hash=None
+          p=pathlib.Path(os.environ.get('BUNDLE_PATH',''))
+          if p.is_file():
+            for line in p.read_text().splitlines():
+              if not line: continue
+              bundle=json.loads(line)
+              statement=json.loads(base64.b64decode(bundle['dsseEnvelope']['payload']))
+              predicate=json.dumps(statement.get('predicate'),sort_keys=True,separators=(',',':'))
+              found = found or canary in predicate
+              predicate_hash=hashlib.sha256(predicate.encode()).hexdigest()
+          projection={'exact_canary_in_predicate':found,'canary_sha256':hashlib.sha256(canary.encode()).hexdigest(),'predicate_sha256':predicate_hash,'attestation_id_present':bool(os.environ.get('ATTESTATION_ID'))}
+          print('ATTEST_SBOM_PROJECTION '+json.dumps(projection,sort_keys=True,separators=(',',':')))
+          PY
